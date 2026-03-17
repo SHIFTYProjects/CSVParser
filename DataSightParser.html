@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataSight | Enterprise Parser</title>
+    
+    <link href="https://unpkg.com/tabulator-tables@5.5.0/dist/css/tabulator_modern.min.css" rel="stylesheet">
+    <script src="https://unpkg.com/tabulator-tables@5.5.0/dist/js/tabulator.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.28/jspdf.plugin.autotable.min.js"></script>
+
+    <style>
+        :root {
+            --header-navy: #1e293b;
+            --accent-blue: #3b82f6;
+            --border-color: #e2e8f0;
+        }
+
+        body { 
+            font-family: 'Segoe UI', system-ui, sans-serif; 
+            margin: 0; background: #f8fafc; height: 100vh; 
+            display: flex; flex-direction: column; color: #334155;
+        }
+
+        .navbar {
+            background: var(--header-navy); color: white;
+            padding: 10px 25px; display: flex; align-items: center; justify-content: space-between;
+        }
+
+        .toolbar { 
+            background: white; padding: 12px 25px; border-bottom: 1px solid var(--border-color);
+            display: flex; align-items: center; gap: 10px; flex-wrap: wrap; position: relative;
+        }
+
+        .stats-badge {
+            background: #f1f5f9; padding: 6px 15px; border-radius: 6px;
+            font-size: 0.85rem; font-weight: 600; border: 1px solid var(--border-color);
+            color: #0f172a;
+        }
+
+        .btn {
+            padding: 7px 15px; border: 1px solid var(--border-color);
+            border-radius: 4px; cursor: pointer; font-size: 0.85rem; background: white;
+            font-weight: 500; transition: background 0.2s;
+        }
+        .btn:hover { background: #f1f5f9; }
+        .btn-primary { background: var(--accent-blue); color: white; border: none; }
+        .btn-primary:hover { background: #2563eb; }
+        .btn-danger { color: #ef4444; border-color: #fca5a5; }
+        .btn-danger:hover { background: #fef2f2; }
+
+        #column-menu {
+            position: absolute; background: white; border: 1px solid var(--border-color);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.15); border-radius: 6px;
+            z-index: 9999; padding: 15px; display: none; width: 260px; top: 100%; margin-top: 5px;
+        }
+
+        .col-checkbox-container {
+            display: flex; align-items: center; padding: 6px 5px; 
+            border-bottom: 1px solid #f1f5f9; cursor: pointer; font-size: 0.85rem;
+        }
+        .col-checkbox-container:hover { background: #f8fafc; }
+        .col-checkbox-container input { margin-right: 10px; cursor: pointer; }
+
+        #table-container { flex-grow: 1; padding: 20px; min-height: 0; }
+        #data-table { background: white; height: 100%; border: 1px solid var(--border-color); border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <div class="navbar">
+        <div style="font-size: 1.2rem; letter-spacing: 1px;">DATASIGHT <b>PARSER</b></div>
+        <div id="file-name" style="font-size: 0.8rem; opacity: 0.8;">No file loaded</div>
+    </div>
+
+    <div class="toolbar">
+        <input type="file" id="file-input" style="display:none" accept=".csv, .xlsx, .xls" />
+        <button class="btn btn-primary" onclick="document.getElementById('file-input').click()">Import File</button>
+        
+        <div class="stats-badge" id="row-count">Waiting for file...</div>
+
+        <div style="position: relative;">
+            <button class="btn" id="col-mgr-btn">Manage Columns ▾</button>
+            <div id="column-menu"></div>
+        </div>
+        
+        <button class="btn btn-danger" id="clear-filters">Reset View</button>
+        <button class="btn" id="download-csv">Export CSV</button>
+        <button class="btn" id="download-pdf">Export PDF</button>
+
+        <div style="margin-left: auto;">
+            <select id="page-size" class="btn">
+                <option value="20">20 Rows</option>
+                <option value="50">50 Rows</option>
+                <option value="100">100 Rows</option>
+                <option value="true" selected>Show All</option>
+            </select>
+        </div>
+    </div>
+
+    <div id="table-container">
+        <div id="data-table"></div>
+    </div>
+
+    <script>
+        let table;
+        let originalFileData = null; 
+        
+        // --- MASTER DUPLICATE FILTER LOGIC ---
+        window.activeDupFields = new Set();
+        window.dupFilterSets = {};
+
+        function masterDuplicateFilter(data) {
+            if (window.activeDupFields.size === 0) return true;
+            for (let field of window.activeDupFields) {
+                let val = data[field];
+                if (window.dupFilterSets[field].has(val)) { return false; }
+                window.dupFilterSets[field].add(val);
+            }
+            return true;
+        }
+
+        // --- TABLE GENERATOR FUNCTION ---
+        function buildGrid(jsonData) {
+            if (table) { table.destroy(); }
+            
+            window.activeDupFields = new Set();
+            window.dupFilterSets = {};
+            document.getElementById('column-menu').style.display = 'none';
+
+            const pageSizeSelect = document.getElementById('page-size').value;
+            const pageSize = pageSizeSelect === "true" ? 1000000 : parseInt(pageSizeSelect);
+
+            table = new Tabulator("#data-table", {
+                data: jsonData,
+                autoColumns: true,
+                layout: "fitDataFill", 
+                pagination: "local",
+                paginationSize: pageSize,
+                autoColumnsDefinitions: function(definitions) {
+                    definitions.forEach(col => {
+                        col.headerFilter = "input";
+                        col.headerFilterLiveFilter = true;
+                        col.originalTitle = col.title || col.field;
+
+                        col.headerMenu = function(e, column) {
+                            let field = column.getField();
+                            let isFiltered = window.activeDupFields.has(field);
+                            return [{
+                                label: isFiltered ? "❌ Restore Duplicates" : "🚫 Hide Duplicates",
+                                action: function(e, column) {
+                                    if (isFiltered) {
+                                        window.activeDupFields.delete(field);
+                                        column.updateDefinition({ title: column.getDefinition().originalTitle });
+                                    } else {
+                                        window.activeDupFields.add(field);
+                                        column.updateDefinition({ title: "🛑 " + column.getDefinition().originalTitle });
+                                    }
+                                    table.refreshFilter(); 
+                                }
+                            }];
+                        };
+
+                        col.mutator = function(value) {
+                            if (value instanceof Date) { return value.toLocaleString(); }
+                            const name = (col.field || "").toLowerCase();
+                            const isDateColumn = name.includes("date") || name.includes("time") || name.includes("created") || name.includes("modified") || name.includes("expire") || name.includes("accessed");
+                            if (isDateColumn && value) {
+                                const num = Number(value);
+                                if (!isNaN(num) && num > 1000000000) {
+                                    const ms = num < 100000000000 ? num * 1000 : num; 
+                                    const d = new Date(ms);
+                                    if (!isNaN(d.getTime())) { return d.toLocaleString(); }
+                                }
+                            }
+                            return value;
+                        };
+                    });
+                    return definitions;
+                }
+            });
+            
+            table.on("tableBuilt", function(){ 
+                table.addFilter(masterDuplicateFilter); 
+                buildColumnMenu(); 
+            });
+            
+            table.on("dataFiltering", function() {
+                window.dupFilterSets = {};
+                window.activeDupFields.forEach(field => {
+                    window.dupFilterSets[field] = new Set();
+                });
+            });
+
+            // FIXED COUNTER LOGIC
+            table.on("dataLoaded", function(data){ 
+                document.getElementById('row-count').innerText = `Showing ${table.getDataCount("active")} of ${table.getDataCount()} Valid Records`;
+            });
+
+            // By accepting the 'rows' parameter directly from the event, we grab the exactly calculated 
+            // array of passing rows in real-time, bypassing any asynchronous delays.
+            table.on("dataFiltered", function(filters, rows){ 
+                document.getElementById('row-count').innerText = `Showing ${rows.length} of ${table.getDataCount()} Valid Records`;
+            });
+        }
+
+
+        // --- DATA PURGE & IMPORT LOGIC ---
+        document.getElementById('file-input').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            document.getElementById('file-name').innerText = file.name;
+            document.getElementById('row-count').innerText = "Parsing File...";
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, {type: 'array', cellDates: true});
+                
+                const rawData = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {defval: ""});
+                
+                originalFileData = rawData.filter(row => {
+                    return Object.values(row).some(val => val !== "" && val !== null && val !== undefined);
+                });
+                
+                buildGrid(originalFileData);
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        // --- COLUMN MENU LOGIC ---
+        const menuBtn = document.getElementById('col-mgr-btn');
+        const menu = document.getElementById('column-menu');
+
+        menuBtn.addEventListener('click', (e) => {
+            e.stopPropagation(); 
+            menu.style.display = menu.style.display === 'block' ? 'none' : 'block';
+        });
+
+        function buildColumnMenu() {
+            menu.innerHTML = `
+                <div style='font-weight:bold; margin-bottom:10px; color:#1e293b;'>Manage Columns</div>
+                <div style='display:flex; gap:10px; margin-bottom:10px; border-bottom:2px solid #e2e8f0; padding-bottom:10px;'>
+                    <button class="btn" style="flex:1; padding:4px; font-size:0.8rem;" id="col-select-all">Select All</button>
+                    <button class="btn" style="flex:1; padding:4px; font-size:0.8rem;" id="col-select-none">Hide All</button>
+                </div>
+                <div id="col-list-container" style="max-height: 300px; overflow-y: auto;"></div>
+            `;
+            
+            const colList = document.getElementById('col-list-container');
+
+            table.getColumns().forEach(column => {
+                let colDef = column.getDefinition();
+                let label = document.createElement("label");
+                label.className = "col-checkbox-container";
+                
+                let checkbox = document.createElement("input");
+                checkbox.type = "checkbox";
+                checkbox.checked = column.isVisible();
+                checkbox.addEventListener("change", () => column.toggle());
+
+                label.appendChild(checkbox);
+                label.appendChild(document.createTextNode(colDef.originalTitle || colDef.field)); 
+                colList.appendChild(label);
+            });
+
+            document.getElementById('col-select-all').addEventListener('click', (e) => {
+                e.stopPropagation();
+                table.getColumns().forEach(c => c.show());
+                buildColumnMenu(); 
+            });
+
+            document.getElementById('col-select-none').addEventListener('click', (e) => {
+                e.stopPropagation();
+                table.getColumns().forEach(c => c.hide());
+                buildColumnMenu(); 
+            });
+        }
+
+        document.addEventListener("click", (e) => {
+            if (!menu.contains(e.target) && e.target !== menuBtn) menu.style.display = 'none';
+        });
+
+        // --- HARD RESET BUTTON ---
+        document.getElementById('clear-filters').addEventListener('click', () => {
+            if (!originalFileData) return; 
+            document.getElementById('row-count').innerText = "Resetting View...";
+            setTimeout(() => { buildGrid(originalFileData); }, 10);
+        });
+
+        // --- EXPORT & PAGINATION ---
+        document.getElementById('page-size').addEventListener('change', (e) => {
+            if (table) {
+                const val = e.target.value === "true" ? 1000000 : parseInt(e.target.value);
+                table.setPageSize(val);
+            }
+        });
+
+        document.getElementById('download-csv').addEventListener('click', () => {
+            if (table) table.download("csv", "DataSight_Export.csv");
+        });
+
+        document.getElementById('download-pdf').addEventListener('click', () => {
+            if (!table) return;
+            if (typeof jspdf === 'undefined') { return alert("PDF library loading. Please try again in a moment."); }
+
+            table.download("pdf", "DataSight_Report.pdf", {
+                orientation: "landscape",
+                autoTable: {
+                    theme: 'grid',
+                    styles: { fontSize: 7, cellPadding: 2, overflow: 'linebreak' },
+                    headStyles: { fillColor: [30, 41, 59] }, 
+                    margin: { top: 35 }, 
+                    didDrawPage: function(data) {
+                        const doc = data.doc;
+                        const timestamp = new Date().toLocaleString();
+                        doc.setFontSize(16);
+                        doc.setTextColor(30, 41, 59);
+                        doc.text("DataSight Enterprise Report", data.settings.margin.left, 18);
+                        doc.setFontSize(10);
+                        doc.setTextColor(100);
+                        doc.text(`Generated on: ${timestamp}`, data.settings.margin.left, 26);
+                    }
+                }
+            });
+        });
+    </script>
+</body>
+</html>
